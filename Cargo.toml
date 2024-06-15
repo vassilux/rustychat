@@ -9,3 +9,4 @@ edition = "2021"
 tokio = { version = "1.28", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"  # Assurez-vous que cette ligne est présente
+clap = "4.5.4"

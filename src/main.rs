@@ -1,86 +1,63 @@
-use std::net::SocketAddr;
+use clap::Parser;
+use std::sync::Arc;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
-    sync::broadcast,
+    io::{self, AsyncBufReadExt},
+    sync::mpsc,
 };
 
+mod client;
+mod manager;
+mod server;
+
+use crate::server::ChatServer;
+
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+
     // Initialiser le serveur de chat
-    let mut server = ChatServer::new("localhost:1661").await;
-    server.run().await;
-}
+    let server = Arc::new(ChatServer::new("localhost:1661").await);
 
-// Structure représentant un client
-struct Client {
-    socket: TcpStream,
-    address: SocketAddr,
-    tx: broadcast::Sender<(String, SocketAddr)>,
-    rx: broadcast::Receiver<(String, SocketAddr)>,
-}
-
-impl Client {
-    async fn new(
-        socket: TcpStream,
-        address: SocketAddr,
-        tx: broadcast::Sender<(String, SocketAddr)>,
-    ) -> Self {
-        let rx = tx.subscribe();
-        Client {
-            socket,
-            address,
-            tx,
-            rx,
-        }
+    // Démarrer le serveur dans une tâche distincte
+    {
+        let server_arc = Arc::clone(&server);
+        tokio::spawn(async move {
+            server_arc.run().await;
+        });
     }
 
-    async fn handle_client(mut self) {
-        let (reader, mut writer) = self.socket.split();
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-
-        loop {
-            tokio::select! {
-                result = reader.read_line(&mut line) => {
-                    if result.unwrap() == 0 {
-                        break;
-                    }
-
-                    self.tx.send((line.clone(), self.address)).unwrap();
-                    line.clear();
-                },
-                result = self.rx.recv() => {
-                    let (msg, other_addr) = result.unwrap();
-                    if self.address != other_addr {
-                        writer.write_all(msg.as_bytes()).await.unwrap();
-                    }
-                }
+    // Tâche pour gérer les commandes
+    {
+        let server_arc = Arc::clone(&server);
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                handle_command(Arc::clone(&server_arc), cmd).await;
             }
+        });
+    }
+
+    // Continuous input loop
+    let stdin = io::stdin();
+    let reader = io::BufReader::new(stdin);
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim() == "/exit" {
+            break;
         }
-    }
-}
-
-// Structure représentant le serveur de chat
-struct ChatServer {
-    listener: TcpListener,
-    tx: broadcast::Sender<(String, SocketAddr)>,
-}
-
-impl ChatServer {
-    async fn new(addr: &str) -> Self {
-        let listener = TcpListener::bind(addr).await.unwrap();
-        let (tx, _rx) = broadcast::channel(10);
-        ChatServer { listener, tx }
+        cmd_tx.send(line.to_string())?;
     }
 
-    async fn run(&mut self) {
-        loop {
-            let (socket, addr) = self.listener.accept().await.unwrap();
-            let client = Client::new(socket, addr, self.tx.clone()).await;
-            tokio::spawn(async move {
-                client.handle_client().await;
-            });
+    Ok(())
+}
+
+async fn handle_command(server: Arc<ChatServer>, cmd: String) {
+    match cmd.as_str() {
+        "/exit" => {
+            println!("Exiting...");
+            std::process::exit(0);
+        }
+        _ => {
+            server.broadcast_message(cmd).await;
         }
     }
 }
